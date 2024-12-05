@@ -13,6 +13,7 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
+
 import argparse
 import warnings
 from dataclasses import dataclass, field
@@ -24,15 +25,12 @@ import torch.nn as nn
 
 warnings.filterwarnings("ignore")  # ignore warning
 
-
 from diffusion import DPMS, FlowEuler
 from diffusion.data.datasets.utils import ASPECT_RATIO_512_TEST, ASPECT_RATIO_1024_TEST, ASPECT_RATIO_2048_TEST
 from diffusion.model.builder import build_model, get_tokenizer_and_text_encoder, get_vae, vae_decode
 from diffusion.model.utils import prepare_prompt_ar, resize_and_crop_tensor
 from diffusion.utils.config import SanaConfig
 from diffusion.utils.logger import get_root_logger
-
-# from diffusion.utils.misc import read_config
 from tools.download import find_model
 
 
@@ -100,7 +98,7 @@ class SanaPipeline(nn.Module):
         elif config.model.mixed_precision == "fp32":
             weight_dtype = torch.float32
         else:
-            raise ValueError(f"weigh precision {config.model.mixed_precision} is not defined")
+            raise ValueError(f"weight precision {config.model.mixed_precision} is not defined")
         self.weight_dtype = weight_dtype
 
         self.base_ratios = eval(f"ASPECT_RATIO_{self.image_size}_TEST")
@@ -121,9 +119,7 @@ class SanaPipeline(nn.Module):
             null_caption_token = self.tokenizer(
                 "", max_length=self.max_sequence_length, padding="max_length", truncation=True, return_tensors="pt"
             ).to(self.device)
-            self.null_caption_embs = self.text_encoder(null_caption_token.input_ids, null_caption_token.attention_mask)[
-                0
-            ]
+            self.null_caption_embs = self.text_encoder(null_caption_token.input_ids, null_caption_token.attention_mask)[0]
 
     def build_vae(self, config):
         vae = get_vae(config.vae_type, config.vae_pretrained, self.device).to(self.weight_dtype)
@@ -182,6 +178,194 @@ class SanaPipeline(nn.Module):
     def register_progress_bar(self, progress_fn=None):
         self.progress_fn = progress_fn if progress_fn is not None else self.progress_fn
 
+    def embed(self, prompt):
+        """
+        Get the embedding of a prompt.
+
+        Args:
+            prompt (str or list): The input prompt or a list of prompts.
+
+        Returns:
+            tuple: A tuple containing the embeddings and masks.
+        """
+        prompts = [prompt] if isinstance(prompt, str) else prompt
+        with torch.no_grad():
+            if not self.config.text_encoder.chi_prompt:
+                max_length_all = self.config.text_encoder.model_max_length
+                prompts_all = prompts
+            else:
+                chi_prompt = "\n".join(self.config.text_encoder.chi_prompt)
+                prompts_all = [chi_prompt + prompt for prompt in prompts]
+                num_chi_prompt_tokens = len(self.tokenizer.encode(chi_prompt))
+                max_length_all = (
+                    num_chi_prompt_tokens + self.config.text_encoder.model_max_length - 2
+                )  # magic number 2: [bos], [_]
+
+            caption_token = self.tokenizer(
+                prompts_all,
+                max_length=max_length_all,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            ).to(device=self.device)
+            select_index = [0] + list(range(-self.config.text_encoder.model_max_length + 1, 0))
+            caption_embs = self.text_encoder(
+                caption_token.input_ids, caption_token.attention_mask
+            )[0][:, None][:, :, select_index].to(self.weight_dtype)
+            emb_masks = caption_token.attention_mask[:, select_index]
+
+        return caption_embs, emb_masks
+
+    @torch.inference_mode()
+    def render_embedding(
+        self,
+        embedding,
+        emb_masks=None,
+        height=1024,
+        width=1024,
+        negative_prompt="",
+        num_inference_steps=20,
+        guidance_scale=5.0,
+        pag_guidance_scale=2.5,
+        num_images_per_prompt=1,
+        generator=torch.Generator().manual_seed(42),
+        latents=None,
+    ):
+        """
+        Generate an image from an embedding.
+
+        Args:
+            embedding (torch.Tensor): The embedding tensor.
+            emb_masks (torch.Tensor): The embedding masks tensor.
+            [Other arguments as needed, matching the forward method.]
+
+        Returns:
+            torch.Tensor: The generated image.
+        """
+        self.ori_height, self.ori_width = height, width
+        self.height, self.width = classify_height_width_bin(height, width, ratios=self.base_ratios)
+        self.latent_size_h, self.latent_size_w = (
+            self.height // self.config.vae.vae_downsample_rate,
+            self.width // self.config.vae.vae_downsample_rate,
+        )
+        self.guidance_type = guidance_type_select(
+            self.guidance_type, pag_guidance_scale, self.config.model.attn_type
+        )
+
+        # Handle negative prompt
+        if negative_prompt != "":
+            null_caption_token = self.tokenizer(
+                negative_prompt,
+                max_length=self.max_sequence_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            ).to(self.device)
+            self.null_caption_embs = self.text_encoder(
+                null_caption_token.input_ids, null_caption_token.attention_mask
+            )[0]
+
+        n = embedding.size(0)
+        if latents is None:
+            z = torch.randn(
+                n,
+                self.config.vae.vae_latent_dim,
+                self.latent_size_h,
+                self.latent_size_w,
+                generator=generator,
+                device=self.device,
+            )
+        else:
+            z = latents.to(self.device)
+
+        model_kwargs = dict(
+            data_info={
+                "img_hw": torch.tensor([[self.image_size, self.image_size]], dtype=torch.float, device=self.device).repeat(n, 1),
+                "aspect_ratio": torch.tensor([[1.0]], device=self.device).repeat(n, 1),
+            },
+            mask=emb_masks,
+        )
+
+        # Sampling
+        if self.vis_sampler == "flow_euler":
+            flow_solver = FlowEuler(
+                self.model,
+                condition=embedding,
+                uncondition=self.null_caption_embs.repeat(n, 1, 1).to(self.weight_dtype),
+                cfg_scale=guidance_scale,
+                model_kwargs=model_kwargs,
+            )
+            sample = flow_solver.sample(
+                z,
+                steps=num_inference_steps,
+            )
+        elif self.vis_sampler == "flow_dpm-solver":
+            scheduler = DPMS(
+                self.model,
+                condition=embedding,
+                uncondition=self.null_caption_embs.repeat(n, 1, 1).to(self.weight_dtype),
+                guidance_type=self.guidance_type,
+                cfg_scale=guidance_scale,
+                pag_scale=pag_guidance_scale,
+                pag_applied_layers=self.config.model.pag_applied_layers,
+                model_type="flow",
+                model_kwargs=model_kwargs,
+                schedule="FLOW",
+            )
+            scheduler.register_progress_bar(self.progress_fn)
+            sample = scheduler.sample(
+                z,
+                steps=num_inference_steps,
+                order=2,
+                skip_type="time_uniform_flow",
+                method="multistep",
+                flow_shift=self.flow_shift,
+            )
+
+        sample = sample.to(self.weight_dtype)
+        with torch.no_grad():
+            sample = vae_decode(self.config.vae.vae_type, self.vae, sample)
+
+        sample = resize_and_crop_tensor(sample, self.ori_width, self.ori_height)
+        return sample
+
+    @torch.inference_mode()
+    def render_prompt(
+        self,
+        prompt,
+        height=1024,
+        width=1024,
+        negative_prompt="",
+        num_inference_steps=20,
+        guidance_scale=5.0,
+        pag_guidance_scale=2.5,
+        num_images_per_prompt=1,
+        generator=torch.Generator().manual_seed(42),
+        latents=None,
+    ):
+        """
+        Generate an image from a prompt.
+
+        Args:
+            prompt (str): The input prompt.
+            [Other arguments as needed, matching the forward method.]
+
+        Returns:
+            torch.Tensor: The generated image.
+        """
+        return self.forward(
+            prompt=prompt,
+            height=height,
+            width=width,
+            negative_prompt=negative_prompt,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            pag_guidance_scale=pag_guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=generator,
+            latents=latents,
+        )
+
     @torch.inference_mode()
     def forward(
         self,
@@ -190,7 +374,7 @@ class SanaPipeline(nn.Module):
         width=1024,
         negative_prompt="",
         num_inference_steps=20,
-        guidance_scale=5,
+        guidance_scale=5.0,
         pag_guidance_scale=2.5,
         num_images_per_prompt=1,
         generator=torch.Generator().manual_seed(42),
@@ -213,9 +397,7 @@ class SanaPipeline(nn.Module):
                 truncation=True,
                 return_tensors="pt",
             ).to(self.device)
-            self.null_caption_embs = self.text_encoder(null_caption_token.input_ids, null_caption_token.attention_mask)[
-                0
-            ]
+            self.null_caption_embs = self.text_encoder(null_caption_token.input_ids, null_caption_token.attention_mask)[0]
 
         if prompt is None:
             prompt = [""]
@@ -224,7 +406,7 @@ class SanaPipeline(nn.Module):
 
         for prompt in prompts:
             # data prepare
-            prompts, hw, ar = (
+            prompts_list, hw, ar = (
                 [],
                 torch.tensor([[self.image_size, self.image_size]], dtype=torch.float, device=self.device).repeat(
                     num_images_per_prompt, 1
@@ -233,16 +415,17 @@ class SanaPipeline(nn.Module):
             )
 
             for _ in range(num_images_per_prompt):
-                prompts.append(prepare_prompt_ar(prompt, self.base_ratios, device=self.device, show=False)[0].strip())
+                prepared_prompt = prepare_prompt_ar(prompt, self.base_ratios, device=self.device, show=False)[0].strip()
+                prompts_list.append(prepared_prompt)
 
             with torch.no_grad():
                 # prepare text feature
                 if not self.config.text_encoder.chi_prompt:
                     max_length_all = self.config.text_encoder.model_max_length
-                    prompts_all = prompts
+                    prompts_all = prompts_list
                 else:
                     chi_prompt = "\n".join(self.config.text_encoder.chi_prompt)
-                    prompts_all = [chi_prompt + prompt for prompt in prompts]
+                    prompts_all = [chi_prompt + prompt for prompt in prompts_list]
                     num_chi_prompt_tokens = len(self.tokenizer.encode(chi_prompt))
                     max_length_all = (
                         num_chi_prompt_tokens + self.config.text_encoder.model_max_length - 2
@@ -260,9 +443,9 @@ class SanaPipeline(nn.Module):
                     :, :, select_index
                 ].to(self.weight_dtype)
                 emb_masks = caption_token.attention_mask[:, select_index]
-                null_y = self.null_caption_embs.repeat(len(prompts), 1, 1)[:, None].to(self.weight_dtype)
+                null_y = self.null_caption_embs.repeat(len(prompts_list), 1, 1)[:, None].to(self.weight_dtype)
 
-                n = len(prompts)
+                n = len(prompts_list)
                 if latents is None:
                     z = torch.randn(
                         n,
@@ -317,6 +500,4 @@ class SanaPipeline(nn.Module):
             sample = resize_and_crop_tensor(sample, self.ori_width, self.ori_height)
             samples.append(sample)
 
-            return sample
-
-        return samples
+        return samples[0] if len(samples) == 1 else samples
